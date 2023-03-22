@@ -1,0 +1,2 @@
+# T2DepthNet
+- Experiment on unsupervised monodepth network based on T2 Net: Synthetic-to-Realistic Translation for Depth Estimation Tasks ([CVPR 2018](https://openaccess.thecvf.com/content_ECCV_2018/papers/Chuanxia_Zheng_T2Net_Synthetic-to-Realistic_Translation_ECCV_2018_paper.pdf))
