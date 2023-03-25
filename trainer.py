@@ -50,8 +50,6 @@ class Trainer:
 
         self.models = {}
         self.train_params = []
-        self.train_params_D = []
-        self.train_params_G = []
 
         self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
 
@@ -122,20 +120,22 @@ class Trainer:
         self.im2im_G = networks.define_G(self.opt.image_nc, self.opt.image_nc, self.opt.ngf, self.opt.transform_layers, self.opt.norm,
                                                   self.opt.activation, self.opt.trans_model_type, self.opt.init_type, self.opt.drop_rate,
                                                   False, self.opt.gpu_ids, self.opt.U_weight)
-        self.train_params_G += list(self.im2im_G.parameters())
-        self.optimizer_G = torch.optim.Adam(self.train_params_G, lr=self.opt.lr_trans, betas=(0.5, 0.9))
-
+        self.optimizer_G = torch.optim.Adam([{'params': filter(lambda p: p.requires_grad, self.im2im_G.parameters())}],
+                                            lr=self.opt.lr_trans, betas=(0.5, 0.9))
+        
         # Discriminator
         self.im2im_D = networks.define_D(self.opt.image_nc, self.opt.ndf, self.opt.image_D_layers, self.opt.num_D, self.opt.norm,
                                               self.opt.activation, self.opt.init_type, self.opt.gpu_ids)
-        self.train_params_D += list(self.im2im_D.parameters())
 
         if not self.opt.only_im2im:
             self.feat_D = networks.define_featureD(self.opt.image_feature, self.opt.feature_D_layers, self.opt.norm,
                                                    self.opt.activation, self.opt.init_type, self.opt.gpu_ids)
-            self.train_params_D += list(self.feat_D.parameters())
-        
-        self.optimizer_D = torch.optim.Adam(self.train_params_D, lr=self.opt.lr_trans, betas=(0.5, 0.9))
+            self.optimizer_D = torch.optim.Adam(itertools.chain(filter(lambda p: p.requires_grad, self.im2im_D.parameters()),
+                                                                filter(lambda p: p.requires_grad, self.feat_D.parameters())),
+                                                lr=self.opt.lr_trans, betas=(0.5, 0.9))
+        else:
+            self.optimizer_D = torch.optim.Adam(itertools.chain(filter(lambda p: p.requires_grad, self.im2im_D.parameters())),
+                                                lr=self.opt.lr_trans, betas=(0.5, 0.9))
 
         self.im2im_schedulers = []
         self.im2im_optimizers = [self.optimizer_D, self.optimizer_G]
@@ -284,6 +284,12 @@ class Trainer:
         print("Training")
         self.set_train()
 
+        if not self.opt.only_im2im:
+            self.model_lr_scheduler.step()
+        
+        for scheduler in self.im2im_schedulers:
+            scheduler.step()
+
         night_iterator = iter(self.train_night_loader)
         for batch_idx, day_inputs in enumerate(self.train_day_loader):
             try:
@@ -296,14 +302,17 @@ class Trainer:
 
             losses = self.process_batch(day_inputs, night_inputs)
             
+            self.optimizer_G.zero_grad()
+            self.optimizer_D.zero_grad()
+
             if not self.opt.only_im2im:
                 self.model_optimizer.zero_grad()
                 networks.freeze(self.feat_D)
 
-            self.optimizer_G.zero_grad()
             networks.freeze(self.im2im_D)
             losses["loss"].backward()
             self.optimizer_G.step()
+
             if not self.opt.only_im2im:
                 self.model_optimizer.step()
             
@@ -313,13 +322,12 @@ class Trainer:
             networks.freeze(self.im2im_G)
             self.freeze_depth()
             
-            self.optimizer_D.zero_grad()
             if not self.opt.only_im2im:
                 losses["D/feat"].backward()
             
             losses["D/img"].backward()
+            self.optimizer_D.step()
             if self.epoch % 5 == 0:
-                self.optimizer_D.step()
                 if not self.opt.only_im2im:
                     for p in self.feat_D.parameters():
                         p.data.clamp_(-0.01, 0.01)
@@ -351,6 +359,28 @@ class Trainer:
         
         losses = {}
         losses["loss"] = 0
+        # night2day_img = self.im2im_G(night_inputs[("color", 0, 0)])[1]
+        # day2day_img = self.im2im_G(day_inputs[("color", 0, 0)])[1]
+
+        # # Loss recons
+        # losses["recons"] = self.l1loss(day_inputs[("color", 0, 0)], day2day_img)
+        # losses["recons"] *= self.opt.lambda_rec_img
+        # losses["loss"] += losses["recons"]
+
+        # # Loss G
+        # night2day_D = self.im2im_D(night2day_img)[0]
+        # day2day_D = self.im2im_D(day2day_img)[0]
+        # source_label = torch.FloatTensor(night2day_D.data.size()).fill_(0).to(self.device)
+        # target_label = torch.FloatTensor(day2day_D.data.size()).fill_(1).to(self.device)
+        # losses["G/img"] = self.mse(day2day_D, source_label) + self.mse(night2day_D, target_label)
+        # losses["G/img"] *= self.opt.lambda_gan_img
+        # losses["loss"] += losses["G/img"]
+        
+        # # Loss D
+        # night2day_D = self.im2im_D(night2day_img.detach())[0]
+        # day2day_D = self.im2im_D(day2day_img.detach())[0]
+        # losses["D/img"] = self.mse(day2day_D, target_label) + self.mse(night2day_D, source_label)
+
         # Night to day task
         night2day_img, day2day_img, f_night, f_day, size = self.forward_G(night_inputs[("color", 0, 0)], day_inputs[("color", 0, 0)]) 
         
@@ -404,16 +434,16 @@ class Trainer:
             losses["loss"] += losses["night"] + losses["day"]
             
             for i in range(self.num_scales):
-                n2d_pred = self.feat_D(n2d_features[i])
-                d2d_pred = self.feat_D(d2d_features[i])
+                n2d_pred = self.feat_D(n2d_features[i])[0]
+                d2d_pred = self.feat_D(d2d_features[i])[0]
                 source_label = torch.FloatTensor(d2d_pred.data.size()).fill_(0).to(self.device)
                 target_label = torch.FloatTensor(n2d_pred.data.size()).fill_(1).to(self.device)
                 losses["G/feat"] = self.mse(d2d_pred, source_label) + self.mse(n2d_pred, target_label)
                 losses["G/feat"] *= self.opt.lambda_gan_img
                 losses["loss"] += losses["G/feat"]
 
-                n2d_pred = self.feat_D(n2d_features[i].detach())
-                d2d_pred = self.feat_D(d2d_features[i].detach())
+                n2d_pred = self.feat_D(n2d_features[i].detach())[0]
+                d2d_pred = self.feat_D(d2d_features[i].detach())[0]
                 losses["D/feat"] = self.mse(d2d_pred, target_label) + self.mse(n2d_pred, source_label)
                 
         return losses
